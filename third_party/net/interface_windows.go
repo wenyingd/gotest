@@ -6,6 +6,7 @@ package net
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"syscall"
@@ -122,4 +123,21 @@ func InterfaceByNameInAllCompartments(name string) (*net.Interface, error) {
 		}
 	}
 	return nil, &net.OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errNoSuchInterface}
+}
+
+func SetInterfaceMTU(idx uint32, mtu uint32, isIPv6 bool) error {
+	family := windows.AF_INET
+	if isIPv6 {
+		family = windows.AF_INET6
+	}
+	ipInterfaceRow := &windows.MibIpInterfaceRow{Family: family, Index: idx}
+	if err := windows.GetIPInterfaceEntry(ipInterfaceRow); err != nil {
+		return fmt.Errorf("unable to get IPInterface entry with Index %d: %v", idx, err)
+	}
+	ipInterfaceRow.NlMtu = mtu
+	ipInterfaceRow.SitePrefixLength = 0
+	if err := windows.SetIPInterfaceEntry(ipInterfaceRow); err != nil {
+		return fmt.Errorf("unable to set IPInterface with MTU %d: %v", mtu, err)
+	}
+	return nil
 }

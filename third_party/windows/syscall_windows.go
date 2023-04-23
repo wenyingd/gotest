@@ -107,14 +107,6 @@ type IpAdapterAddresses struct {
 	/* more fields might be present here. */
 }
 
-type FILE_BASIC_INFO struct {
-	CreationTime   syscall.Filetime
-	LastAccessTime syscall.Filetime
-	LastWriteTime  syscall.Filetime
-	ChangedTime    syscall.Filetime
-	FileAttributes uint32
-}
-
 // IsSystemDLL reports whether the named dll key (a base name, like
 // "foo.dll") is a system DLL which should only be loaded from the
 // Windows SYSTEM32 directory.
@@ -135,11 +127,106 @@ func Add(dll string) string {
 	return dll
 }
 
+// copy from internal/syscall/windows/security_windows.go
+type LUID struct {
+	LowPart  uint32
+	HighPart int32
+}
+
+type AddressFamily uint16
+
+const (
+	AF_UNSPEC AddressFamily = 0
+	AF_INET   AddressFamily = 2
+	AF_INET6  AddressFamily = 23
+)
+
+type RouterDiscoveryBehavior int32
+
+const (
+	RouterDiscoveryDisabled  RouterDiscoveryBehavior = 0
+	RouterDiscoveryEnabled   RouterDiscoveryBehavior = 1
+	RouterDiscoveryDHCP      RouterDiscoveryBehavior = 2
+	RouterDiscoveryUnchanged RouterDiscoveryBehavior = -1
+)
+
+type LinkLocalAddressBehavior int32
+
+const (
+	LinkLocalAlwaysOff LinkLocalAddressBehavior = 0
+	LinkLocalDelayed   LinkLocalAddressBehavior = 1
+	LinkLocalAlwaysOn  LinkLocalAddressBehavior = 2
+	LinkLocalUnchanged LinkLocalAddressBehavior = -1
+)
+
+const ScopeLevelCount = 16
+
+type NlInterfaceOffloadRodFlags uint8
+
+const (
+	NlChecksumSupported         NlInterfaceOffloadRodFlags = 0x01
+	nlOptionsSupported          NlInterfaceOffloadRodFlags = 0x02
+	TlDatagramChecksumSupported NlInterfaceOffloadRodFlags = 0x04
+	TlStreamChecksumSupported   NlInterfaceOffloadRodFlags = 0x08
+	TlStreamOptionsSupported    NlInterfaceOffloadRodFlags = 0x10
+	FastPathCompatible          NlInterfaceOffloadRodFlags = 0x20
+	TlLargeSendOffloadSupported NlInterfaceOffloadRodFlags = 0x40
+	TlGiantSendOffloadSupported NlInterfaceOffloadRodFlags = 0x80
+)
+
+type MibIpInterfaceRow struct {
+	Family                               AddressFamily
+	Luid                                 uint64
+	Index                                uint32
+	MaxReassemblySize                    uint32
+	Identifier                           uint64
+	MinRouterAdvertisementInterval       uint32
+	MaxRouterAdvertisementInterval       uint32
+	AdvertisingEnabled                   bool
+	ForwardingEnabled                    bool
+	WeakHostSend                         bool
+	WeakHostReceive                      bool
+	UseAutomaticMetric                   bool
+	UseNeighborUnreachabilityDetection   bool
+	ManagedAddressConfigurationSupported bool
+	OtherStatefulConfigurationSupported  bool
+	AdvertiseDefaultRoute                bool
+	RouterDiscoveryBehavior              RouterDiscoveryBehavior
+	DadTransmits                         uint32
+	BaseReachableTime                    uint32
+	RetransmitTime                       uint32
+	PathMtuDiscoveryTimeout              uint32
+	LinkLocalAddressBehavior             LinkLocalAddressBehavior
+	LinkLocalAddressTimeout              uint32
+	ZoneIndices                          [ScopeLevelCount]uint32
+	SitePrefixLength                     uint32
+	Metric                               uint32
+	NlMtu                                uint32
+	Connected                            bool
+	SupportsWakeUpPatterns               bool
+	SupportsNeighborDiscovery            bool
+	SupportsRouterDiscovery              bool
+	ReachableTime                        uint32
+	TransmitOffload                      NlInterfaceOffloadRodFlags
+	ReceiveOffload                       NlInterfaceOffloadRodFlags
+	DisableDefaultRoutes                 bool
+}
+
+type MibIpInterfaceTable struct {
+	NumEntries uint32
+	Table      [anysize]*MibIpInterfaceRow
+}
+
 var (
 	modiphlpapi = syscall.NewLazyDLL(Add("iphlpapi.dll"))
 
 	procGetAdaptersAddresses = modiphlpapi.NewProc("GetAdaptersAddresses")
+	procGetIpInterfaceEntry  = modiphlpapi.NewProc("GetIpInterfaceEntry")
+	procSetIpInterfaceEntry  = modiphlpapi.NewProc("SetIpInterfaceEntry")
+	procGetIpInterfaceTable  = modiphlpapi.NewProc("GetIpInterfaceTable")
 )
+
+const anysize = 1
 
 // UTF16PtrToString is like UTF16ToString, but takes *uint16
 // as a parameter instead of []uint16.
@@ -165,7 +252,31 @@ func UTF16PtrToString(p *uint16) string {
 }
 
 func GetAdaptersAddresses(family uint32, flags uint32, reserved uintptr, adapterAddresses *IpAdapterAddresses, sizePointer *uint32) (errcode error) {
-	r0, _, _ := syscall.Syscall6(procGetAdaptersAddresses.Addr(), 5, uintptr(family), uintptr(flags), uintptr(reserved), uintptr(unsafe.Pointer(adapterAddresses)), uintptr(unsafe.Pointer(sizePointer)), 0)
+	r0, _, _ := syscall.SyscallN(procGetAdaptersAddresses.Addr(), uintptr(family), uintptr(flags), uintptr(reserved), uintptr(unsafe.Pointer(adapterAddresses)), uintptr(unsafe.Pointer(sizePointer)))
+	if r0 != 0 {
+		errcode = syscall.Errno(r0)
+	}
+	return
+}
+
+func GetIPInterfaceEntry(ipInterfaceRow *MibIpInterfaceRow) (errcode error) {
+	r0, _, _ := syscall.SyscallN(procGetIpInterfaceEntry.Addr(), uintptr(unsafe.Pointer(ipInterfaceRow)))
+	if r0 != 0 {
+		errcode = syscall.Errno(r0)
+	}
+	return
+}
+
+func SetIPInterfaceEntry(ipInterfaceRow *MibIpInterfaceRow) (errcode error) {
+	r0, _, _ := syscall.SyscallN(procSetIpInterfaceEntry.Addr(), uintptr(unsafe.Pointer(ipInterfaceRow)))
+	if r0 != 0 {
+		errcode = syscall.Errno(r0)
+	}
+	return
+}
+
+func GetIPInterfaceTable(family AddressFamily, ipInterfaceTable *MibIpInterfaceTable) (errcode error) {
+	r0, _, _ := syscall.SyscallN(procGetIpInterfaceTable.Addr(), uintptr(family), uintptr(unsafe.Pointer(ipInterfaceTable)))
 	if r0 != 0 {
 		errcode = syscall.Errno(r0)
 	}
