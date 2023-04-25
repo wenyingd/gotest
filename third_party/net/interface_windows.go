@@ -7,53 +7,25 @@ package net
 import (
 	"errors"
 	"fmt"
+	"k8s.io/klog/v2"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 
-	"windows_net/third_party/windows"
+	"github.com/Microsoft/hcsshim"
+	"golang.org/x/sys/windows"
+
+	testwindows "windows_net/third_party/windows"
 )
 
-// adapterAddresses returns a list of IP adapter and address
-// structures. The structure contains an IP adapter and flattened
-// multiple IP addresses including unicast, anycast and multicast
-// addresses.
-func adapterAddresses(flags uint32) ([]*windows.IpAdapterAddresses, error) {
-	var b []byte
-	l := uint32(15000) // recommended initial size
-	for {
-		b = make([]byte, l)
-		err := windows.GetAdaptersAddresses(syscall.AF_UNSPEC, flags, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &l)
-		if err == nil {
-			if l == 0 {
-				return nil, nil
-			}
-			break
-		}
-		if err.(syscall.Errno) != syscall.ERROR_BUFFER_OVERFLOW {
-			return nil, os.NewSyscallError("getadaptersaddresses", err)
-		}
-		if l <= uint32(len(b)) {
-			return nil, os.NewSyscallError("getadaptersaddresses", err)
-		}
-	}
-	var aas []*windows.IpAdapterAddresses
-	for aa := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])); aa != nil; aa = aa.Next {
-		aas = append(aas, aa)
-	}
-	return aas, nil
-}
-
-// If the ifindex is zero, interfaceTable returns mappings of all
-// network interfaces. Otherwise it returns a mapping of a specific
-// interface.
-func interfaceTable(ifindex int, flags uint32) ([]net.Interface, error) {
-	aas, err := adapterAddresses(flags)
+func adapterTable(ifindex int) ([]Adapter, error) {
+	aas, err := adapterAddresses()
 	if err != nil {
 		return nil, err
 	}
-	var ift []net.Interface
+	var adapters []Adapter
 	for _, aa := range aas {
 		index := aa.IfIndex
 		if index == 0 { // ipv6IfIndex is a substitute for ifIndex
@@ -90,30 +62,89 @@ func interfaceTable(ifindex int, flags uint32) ([]net.Interface, error) {
 				ifi.HardwareAddr = make(net.HardwareAddr, aa.PhysicalAddressLength)
 				copy(ifi.HardwareAddr, aa.PhysicalAddress[:])
 			}
-			ift = append(ift, ifi)
+			adapter := Adapter{
+				Interface:     ifi,
+				CompartmentID: aa.CompartmentId,
+			}
+			adapters = append(adapters, adapter)
 			if ifindex == ifi.Index {
 				break
 			}
 		}
 	}
-	return ift, nil
+	return adapters, nil
+}
+
+// adapterAddresses returns a list of IP adapter and address
+// structures. The structure contains an IP adapter and flattened
+// multiple IP addresses including unicast, anycast and multicast
+// addresses.
+// This function is copied from go/src/net/interface_windows.go, the difference is flag
+// GAA_FLAG_INCLUDE_ALL_COMPARTMENTS is introduced to query interfaces in all compartments.
+func adapterAddresses() ([]*windows.IpAdapterAddresses, error) {
+	flags := uint32(testwindows.GAA_FLAG_INCLUDE_PREFIX | testwindows.GAA_FLAG_INCLUDE_ALL_COMPARTMENTS)
+	var b []byte
+	l := uint32(15000) // recommended initial size
+	for {
+		b = make([]byte, l)
+		err := windows.GetAdaptersAddresses(syscall.AF_UNSPEC, flags, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &l)
+		if err == nil {
+			if l == 0 {
+				return nil, nil
+			}
+			break
+		}
+		if err.(syscall.Errno) != syscall.ERROR_BUFFER_OVERFLOW {
+			return nil, os.NewSyscallError("getadaptersaddresses", err)
+		}
+		if l <= uint32(len(b)) {
+			return nil, os.NewSyscallError("getadaptersaddresses", err)
+		}
+	}
+	var aas []*windows.IpAdapterAddresses
+	for aa := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])); aa != nil; aa = aa.Next {
+		aas = append(aas, aa)
+	}
+	return aas, nil
+}
+
+type Adapter struct {
+	net.Interface
+	CompartmentID uint32
+}
+
+func (a *Adapter) SetMTU(mtu int, family testwindows.AddressFamily) error {
+	runtime.LockOSThread()
+	defer func() {
+		hcsshim.SetCurrentThreadCompartmentId(0)
+		runtime.UnlockOSThread()
+	}()
+	if err := hcsshim.SetCurrentThreadCompartmentId(a.CompartmentID); err != nil {
+		klog.ErrorS(err, "Failed to change current thread's compartment", "compartment", a.CompartmentID)
+		return err
+	}
+	ipInterfaceRow := &testwindows.MibIpInterfaceRow{Family: family, Index: uint32(a.Index)}
+	if err := testwindows.GetIPInterfaceEntry(ipInterfaceRow); err != nil {
+		return fmt.Errorf("unable to get IPInterface entry with Index %d: %v", a.Index, err)
+	}
+	ipInterfaceRow.NlMtu = uint32(mtu)
+	ipInterfaceRow.SitePrefixLength = 0
+	if err := testwindows.SetIPInterfaceEntry(ipInterfaceRow); err != nil {
+		return fmt.Errorf("unable to set IPInterface with MTU %d: %v", mtu, err)
+	}
+	return nil
 }
 
 var (
-	errInvalidInterface         = errors.New("invalid network interface")
-	errInvalidInterfaceIndex    = errors.New("invalid network interface index")
-	errInvalidInterfaceName     = errors.New("invalid network interface name")
-	errNoSuchInterface          = errors.New("no such network interface")
-	errNoSuchMulticastInterface = errors.New("no such multicast network interface")
+	errInvalidInterfaceName = errors.New("invalid network interface name")
+	errNoSuchInterface      = errors.New("no such network interface")
 )
 
-// InterfaceByNameInAllCompartments returns the interface specified by name.
-func InterfaceByNameInAllCompartments(name string) (*net.Interface, error) {
+func GetAdapterInAllCompartmentsByName(name string) (*Adapter, error) {
 	if name == "" {
 		return nil, &net.OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterfaceName}
 	}
-	flags := uint32(windows.GAA_FLAG_INCLUDE_PREFIX | windows.GAA_FLAG_INCLUDE_ALL_COMPARTMENTS)
-	ift, err := interfaceTable(0, flags)
+	ift, err := adapterTable(0)
 	if err != nil {
 		return nil, &net.OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
 	}
@@ -125,19 +156,14 @@ func InterfaceByNameInAllCompartments(name string) (*net.Interface, error) {
 	return nil, &net.OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errNoSuchInterface}
 }
 
-func SetInterfaceMTU(idx uint32, mtu uint32, isIPv6 bool) error {
-	family := windows.AF_INET
+func SetInterfaceMTU(name string, mtu int, isIPv6 bool) error {
+	adapter, err := GetAdapterInAllCompartmentsByName(name)
+	if err != nil {
+		return fmt.Errorf("unable to find NetAdapter on host in all compartments with name %s: %v", name, err)
+	}
+	family := testwindows.AF_INET
 	if isIPv6 {
-		family = windows.AF_INET6
+		family = testwindows.AF_INET6
 	}
-	ipInterfaceRow := &windows.MibIpInterfaceRow{Family: family, Index: idx}
-	if err := windows.GetIPInterfaceEntry(ipInterfaceRow); err != nil {
-		return fmt.Errorf("unable to get IPInterface entry with Index %d: %v", idx, err)
-	}
-	ipInterfaceRow.NlMtu = mtu
-	ipInterfaceRow.SitePrefixLength = 0
-	if err := windows.SetIPInterfaceEntry(ipInterfaceRow); err != nil {
-		return fmt.Errorf("unable to set IPInterface with MTU %d: %v", mtu, err)
-	}
-	return nil
+	return adapter.SetMTU(mtu, family)
 }

@@ -11,7 +11,7 @@ import (
 )
 
 func hostInterfaceExists(name string) (bool, error) {
-	adapter, err := antreanet.InterfaceByNameInAllCompartments(name)
+	adapter, err := antreanet.GetAdapterInAllCompartmentsByName(name)
 	if err != nil {
 		if strings.Contains(err.Error(), "no such network interface") {
 			return false, nil
@@ -22,12 +22,8 @@ func hostInterfaceExists(name string) (bool, error) {
 	return true, nil
 }
 
-func setIfEntryMTU(name string, mtu uint32) error {
-	adapter, err := antreanet.InterfaceByNameInAllCompartments(name)
-	if err != nil {
-		return err
-	}
-	return antreanet.SetInterfaceMTU(uint32(adapter.Index), mtu, false)
+func setIfEntryMTU(name string, mtu int) error {
+	return antreanet.SetInterfaceMTU(name, mtu, false)
 }
 
 func main() {
@@ -42,7 +38,7 @@ func main() {
 	if err != nil {
 		klog.ErrorS(err, "Unable to parse MTU")
 	}
-	if err := setIfEntryMTU(name, uint32(mtu)); err != nil {
+	if err := setIfEntryMTU(name, mtu); err != nil {
 		klog.ErrorS(err, "failed to set network interface MTU", "name", name, "mtu", 1400)
 		os.Exit(1)
 	}
